@@ -22,6 +22,15 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from utils.desk_compare import (
+    append_eval_history,
+    ensure_monitor_manifest,
+    load_split_manifest,
+    monitor_dir,
+    resolve_monitor_target,
+    save_tensor_image,
+    write_metrics_summary,
+)
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -70,6 +79,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    split_manifest = load_split_manifest(getattr(dataset, "split_manifest", ""))
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -155,7 +165,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            training_report(
+                tb_writer,
+                iteration,
+                Ll1,
+                loss,
+                l1_loss,
+                iter_start.elapsed_time(iter_end),
+                testing_iterations,
+                scene,
+                render,
+                (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp),
+                dataset.train_test_exp,
+                dataset,
+                split_manifest,
+            )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -211,7 +235,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, dataset, split_manifest):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -227,6 +251,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                ssim_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -239,12 +264,45 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    ssim_test += ssim(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                l1_test /= len(config['cameras'])
+                ssim_test /= len(config['cameras'])
+                record = {
+                    "iteration": int(iteration),
+                    "split": config['name'],
+                    "scope": "eval",
+                    "num_views": int(len(config['cameras'])),
+                    "l1": float(l1_test),
+                    "psnr": float(psnr_test),
+                    "ssim": float(ssim_test),
+                    "num_gaussians": int(scene.gaussians.get_xyz.shape[0]),
+                }
+                append_eval_history(scene.model_path, record)
+                if config['name'] == "test":
+                    write_metrics_summary(scene.model_path, record)
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {}".format(iteration, config['name'], l1_test, psnr_test, ssim_test))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
+
+        monitor_split = getattr(dataset, "monitor_split", "test")
+        monitor_cameras = scene.getTestCameras() if monitor_split == "test" else scene.getTrainCameras()
+        if monitor_cameras:
+            resolved_split, resolved_index, monitor_camera = resolve_monitor_target(
+                split_manifest,
+                monitor_split,
+                getattr(dataset, "monitor_index", 0),
+                getattr(dataset, "monitor_view_name", ""),
+                monitor_cameras,
+            )
+            monitor_output_dir = monitor_dir(scene.model_path, resolved_split, resolved_index, monitor_camera.image_name)
+            ensure_monitor_manifest(monitor_output_dir, resolved_split, resolved_index, monitor_camera.image_name, 1)
+            gt_image = torch.clamp(monitor_camera.original_image.to("cuda"), 0.0, 1.0)
+            render_image = torch.clamp(renderFunc(monitor_camera, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+            save_tensor_image(gt_image, monitor_output_dir / "gt.png")
+            save_tensor_image(render_image, monitor_output_dir / "renders" / f"{iteration:06d}.png")
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
