@@ -130,4 +130,8 @@ def append_eval_history(model_path: str, record: dict):
 
 def write_metrics_summary(model_path: str, payload: dict):
     metrics_path = Path(model_path) / "metrics.json"
-    metrics_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    normalized = dict(payload)
+    if "l1" in normalized and "test_l1" not in normalized:
+        normalized["test_l1"] = normalized["l1"]
+    normalized.setdefault("status", "completed")
+    metrics_path.write_text(json.dumps(normalized, indent=2, ensure_ascii=True), encoding="utf-8")
